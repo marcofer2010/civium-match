@@ -6,19 +6,13 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
-# Instalar dependências do sistema
+# Instalar dependências mínimas do sistema
 RUN apt-get update && apt-get install -y \
     build-essential \
-    libopencv-dev \
-    libglib2.0-0 \
-    libsm6 \
-    libxext6 \
-    libxrender-dev \
-    libgomp1 \
-    libgcc-s1 \
-    wget \
+    bash \
     curl \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
 
 # Criar usuário não-root
 RUN useradd --create-home --shell /bin/bash civium
@@ -39,11 +33,11 @@ RUN mkdir -p data logs temp && \
 USER civium
 
 # Expor porta
-EXPOSE 8001
+EXPOSE 8002
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=30s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:8001/health || exit 1
+    CMD curl -f http://localhost:8002/health || exit 1
 
 # Comando padrão
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8001", "--reload"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8002"]

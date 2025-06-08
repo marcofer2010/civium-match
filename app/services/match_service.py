@@ -26,10 +26,10 @@ from app.utils.logger import setup_logger
 class Collection:
     """Representa uma collection de faces."""
     
-    def __init__(self, company_id: str, company_type: str, collection_type: str, 
+    def __init__(self, company_id: int, company_type: str, collection_type: str, 
                  metadata: Optional[Dict] = None):
         self.company_id = company_id
-        self.company_type = company_type  # 'public_org' ou 'private'
+        self.company_type = company_type  # 'public' ou 'private'
         self.collection_type = collection_type  # 'known' ou 'unknown'
         self.metadata = metadata or {}
         self.created_at = datetime.utcnow()
@@ -37,24 +37,31 @@ class Collection:
         self.face_count = 0
         self.was_just_created = False
         
+        # Logger
+        self.logger = setup_logger(f"collection-{self.collection_key}")
+        
         # FAISS index para esta collection
         self.index: Optional[faiss.Index] = None
+        self.face_id_mapping: Dict[int, str] = {}  # Mapear index_position para face_id
         self.face_ids: List[str] = []  # Mapear posição no index para face_id
         self.face_metadata: Dict[str, Dict] = {}  # Metadata por face_id
+        
+        # Soft delete - posições marcadas como removidas
+        self.removed_positions: set = set()  # Set de index_positions removidas
         
         self._initialize_index()
     
     @property
     def collection_key(self) -> str:
         """Chave única da collection."""
-        tenant_category = "public" if self.company_type == "public_org" else "private"
+        tenant_category = "public" if self.company_type == "public" else "private"
         return f"{tenant_category}/{self.company_id}/{self.collection_type}"
     
     @property
     def collection_path(self) -> str:
         """Caminho da collection no filesystem."""
-        tenant_category = "public" if self.company_type == "public_org" else "private"
-        return f"collections/{tenant_category}/{self.company_id}/{self.collection_type}"
+        tenant_category = "public" if self.company_type == "public" else "private"
+        return f"collections/{tenant_category}/{str(self.company_id)}/{self.collection_type}"
     
     def _initialize_index(self):
         """Inicializa o índice FAISS para esta collection."""
@@ -62,28 +69,72 @@ class Collection:
         self.index = faiss.IndexFlatIP(settings.EMBEDDING_DIMENSION)
         # Para busca por similaridade cosseno, normalizar embeddings
         
-    def add_face(self, embedding: np.ndarray, face_id: str, person_id: Optional[str] = None,
-                metadata: Optional[Dict] = None) -> None:
-        """Adiciona uma face à collection."""
-        # Normalizar embedding para similaridade cosseno
-        embedding = embedding.astype(np.float32)
-        faiss.normalize_L2(embedding.reshape(1, -1))
+    def add_face(self, embedding: np.ndarray, face_id: str) -> None:
+        """
+        Adiciona uma face à collection.
+        
+        Args:
+            embedding: Embedding da face
+            face_id: ID único da face
+        """
+        if self.index is None:
+            self._initialize_index()
         
         # Adicionar ao índice FAISS
-        self.index.add(embedding.reshape(1, -1))
+        embedding_2d = embedding.reshape(1, -1).astype(np.float32)
+        self.index.add(embedding_2d)
         
-        # Mapear posição para face_id
+        # Mapear posição no índice para face_id
+        index_position = self.index.ntotal - 1
+        self.face_id_mapping[index_position] = face_id
         self.face_ids.append(face_id)
-        
-        # Armazenar metadata
         self.face_metadata[face_id] = {
-            'person_id': person_id,
-            'metadata': metadata or {},
             'added_at': datetime.utcnow()
         }
         
         self.face_count += 1
         self.updated_at = datetime.utcnow()
+        
+        self.logger.debug(f"Face {face_id} adicionada à collection {self.collection_key} na posição {index_position}")
+        
+        # Salvar automaticamente
+        self.save_to_disk()
+    
+    def remove_face(self, index_position: int) -> bool:
+        """
+        Remove uma face da collection (soft delete).
+        
+        Args:
+            index_position: Posição no índice FAISS
+            
+        Returns:
+            True se removido com sucesso, False se não encontrado
+        """
+        if index_position < 0 or index_position >= self.face_count:
+            self.logger.warning(f"Posição inválida para remoção: {index_position}")
+            return False
+            
+        if index_position in self.removed_positions:
+            self.logger.warning(f"Face na posição {index_position} já está removida")
+            return False
+        
+        # Marcar como removida (soft delete)
+        self.removed_positions.add(index_position)
+        
+        # Remover metadata se existir
+        if index_position in self.face_id_mapping:
+            face_id = self.face_id_mapping[index_position]
+            if face_id in self.face_metadata:
+                del self.face_metadata[face_id]
+        
+        self.updated_at = datetime.utcnow()
+        
+        self.logger.info(f"Face na posição {index_position} marcada como removida (soft delete)")
+        
+        # Salvar alterações
+        self.save_to_disk()
+        
+        return True
     
     def search(self, embedding: np.ndarray, top_k: int = 10, threshold: float = 0.4) -> List[Dict]:
         """Busca faces similares na collection."""
@@ -94,8 +145,9 @@ class Collection:
         query_embedding = embedding.astype(np.float32)
         faiss.normalize_L2(query_embedding.reshape(1, -1))
         
-        # Buscar no índice
-        similarities, indices = self.index.search(query_embedding.reshape(1, -1), min(top_k, self.face_count))
+        # Buscar mais resultados para compensar faces removidas
+        search_k = min(top_k * 3, self.face_count)  # Buscar 3x mais para filtrar removidas
+        similarities, indices = self.index.search(query_embedding.reshape(1, -1), search_k)
         
         results = []
         for i, (similarity, index) in enumerate(zip(similarities[0], indices[0])):
@@ -104,12 +156,20 @@ class Collection:
                 
             if similarity < threshold:  # Abaixo do threshold
                 continue
+                
+            # FILTRAR POSIÇÕES REMOVIDAS (soft delete)
+            if index in self.removed_positions:
+                continue
             
             results.append({
                 'index_position': int(index),  # Retornar posição no índice FAISS
                 'similarity': float(similarity),
                 'confidence': float(similarity * 100)  # Converter para percentual
             })
+            
+            # Parar quando atingir top_k resultados válidos
+            if len(results) >= top_k:
+                break
         
         return results
     
@@ -134,14 +194,16 @@ class Collection:
                 'updated_at': self.updated_at,
                 'face_count': self.face_count,
                 'face_ids': self.face_ids,
-                'face_metadata': self.face_metadata
+                'face_id_mapping': self.face_id_mapping,
+                'face_metadata': self.face_metadata,
+                'removed_positions': self.removed_positions
             }, f)
     
     @classmethod
-    def load_from_disk(cls, company_id: str, company_type: str, collection_type: str) -> 'Collection':
+    def load_from_disk(cls, company_id: int, company_type: str, collection_type: str) -> 'Collection':
         """Carrega collection do disco."""
-        tenant_category = "public" if company_type == "public_org" else "private"
-        collection_path = f"collections/{tenant_category}/{company_id}/{collection_type}"
+        tenant_category = "public" if company_type == "public" else "private"
+        collection_path = f"collections/{tenant_category}/{str(company_id)}/{collection_type}"
         
         # Carregar metadata
         metadata_path = f"{collection_path}.pkl"
@@ -161,7 +223,9 @@ class Collection:
         collection.updated_at = data['updated_at']
         collection.face_count = data['face_count']
         collection.face_ids = data['face_ids']
+        collection.face_id_mapping = data['face_id_mapping']
         collection.face_metadata = data['face_metadata']
+        collection.removed_positions = data['removed_positions']
         
         # Carregar índice FAISS
         index_path = f"{collection_path}.index"
@@ -178,14 +242,14 @@ class CollectionManager:
         self.logger = setup_logger("collection-manager")
         self.collections_cache: Dict[str, Collection] = {}
     
-    async def get_or_create_collection(self, company_id: str, company_type: str, 
+    async def get_or_create_collection(self, company_id: int, company_type: str, 
                                      collection_type: str) -> Collection:
         """Retorna collection existente ou cria nova se não existir."""
-        tenant_category = "public" if company_type == "public_org" else "private"
+        tenant_category = "public" if company_type == "public" else "private"
         collection_key = f"{tenant_category}/{company_id}/{collection_type}"
         
         if collection_key not in self.collections_cache:
-            collection_path = f"collections/{tenant_category}/{company_id}/{collection_type}"
+            collection_path = f"collections/{tenant_category}/{str(company_id)}/{collection_type}"
             
             if os.path.exists(f"{collection_path}.pkl"):
                 # Carregar existente
@@ -220,8 +284,8 @@ class CollectionManager:
             if os.path.isdir(company_path):
                 try:
                     collection = await self.get_or_create_collection(
-                        company_id=company_dir,
-                        company_type="public_org",
+                        company_id=int(company_dir),
+                        company_type="public",
                         collection_type="known"
                     )
                     collections.append(collection)
@@ -263,10 +327,10 @@ class MatchService:
             self.logger.error(f"❌ Erro ao inicializar Match Service: {e}")
             raise
     
-    async def smart_match(self, embedding: List[float], company_id: str, company_type: str,
+    async def smart_match(self, embedding: List[float], company_id: int, company_type: str,
                          camera_shared: bool = False, search_unknown: bool = False,
                          auto_register: bool = False, threshold: float = None, 
-                         top_k: int = None, metadata: Dict = None) -> SmartMatchResponse:
+                         top_k: int = None) -> SmartMatchResponse:
         """
         Busca inteligente com lógica em cascata:
         1. Buscar em collections 'known' (federada se câmera compartilhada)
@@ -278,7 +342,6 @@ class MatchService:
         # Usar defaults se não fornecidos
         threshold = threshold or settings.DEFAULT_MATCH_THRESHOLD
         top_k = top_k or settings.DEFAULT_TOP_K
-        metadata = metadata or {}
         
         # Converter embedding para numpy
         embedding_array = np.array(embedding, dtype=np.float32)
@@ -390,7 +453,7 @@ class MatchService:
                 self.logger.info(f"✅ Encontrado em collection 'unknown': {company_id}")
                 
                 # Organizar o match na nova estrutura por categoria
-                category = "public" if company_type == "public_org" else "private"
+                category = "public" if company_type == "public" else "private"
                 matches_formatted = {
                     category: {
                         company_id: [MatchResult(
@@ -421,9 +484,7 @@ class MatchService:
                 company_id=company_id,
                 company_type=company_type,
                 collection_type="unknown",
-                embedding=embedding,
-                person_id=None,
-                metadata=metadata
+                embedding=embedding
             )
             
             search_time_ms = (time.time() - start_time) * 1000
@@ -499,7 +560,7 @@ class MatchService:
                 collection, matches = result
                 
                 # Determinar categoria baseada no tipo da empresa
-                category = "public" if collection.company_type == "public_org" else "private"
+                category = "public" if collection.company_type == "public" else "private"
                 company_id = collection.company_id
                 
                 # Simplificar matches (usar apenas dados do FAISS)
@@ -524,9 +585,8 @@ class MatchService:
         
         return all_results[:top_k], results_by_category
     
-    async def add_face_to_collection(self, company_id: str, company_type: str, collection_type: str,
-                                    embedding: List[float], person_id: Optional[str] = None, 
-                                    metadata: Optional[Dict] = None) -> int:
+    async def add_face_to_collection(self, company_id: int, company_type: str, collection_type: str,
+                                    embedding: List[float]) -> int:
         """Adiciona uma face a uma collection."""
         collection = await self.collection_manager.get_or_create_collection(
             company_id, company_type, collection_type
@@ -541,7 +601,7 @@ class MatchService:
         index_position = collection.face_count
         
         # Adicionar à collection
-        collection.add_face(embedding_array, face_id, person_id, metadata)
+        collection.add_face(embedding_array, face_id)
         
         # Salvar alterações
         collection.save_to_disk()
@@ -549,6 +609,22 @@ class MatchService:
         self.logger.info(f"👤 Face adicionada na posição {index_position} à collection {collection.collection_key}")
         
         return index_position
+    
+    async def remove_face_from_collection(self, company_id: int, company_type: str, 
+                                        collection_type: str, index_position: int) -> bool:
+        """Remove uma face de uma collection."""
+        collection = await self.collection_manager.get_or_create_collection(
+            company_id, company_type, collection_type
+        )
+        
+        success = collection.remove_face(index_position)
+        
+        if success:
+            self.logger.info(f"🗑️ Face removida da posição {index_position} da collection {collection.collection_key}")
+        else:
+            self.logger.warning(f"❌ Falha ao remover face da posição {index_position} da collection {collection.collection_key}")
+        
+        return success
     
     async def get_stats(self) -> ServiceStats:
         """Retorna estatísticas do serviço."""

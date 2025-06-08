@@ -108,13 +108,13 @@ POST /api/smart-match
 ```json
 {
     "embedding": [0.1, 0.2, ...],           // 512 dimensões
-    "company_id": "empresa_001",             // ID da empresa
-    "company_type": "private",               // "private" ou "public_org"
+    "company_id": 123,
+    "company_type": "private",               // "private" ou "public"
     "camera_shared": false,                  // Câmera compartilhada?
-    "search_unknown": true,                  // Buscar em 'unknown'?
-    "auto_register": true,                   // Auto-cadastrar se não encontrar?
+    "search_unknown": false,                  // Buscar em 'unknown'?
+    "auto_register": false,                   // Auto-cadastrar se não encontrar?
     "threshold": 0.4,                        // Threshold de similaridade
-    "top_k": 10,                            // Máximo de resultados
+    "top_k": 5,                            // Máximo de resultados
     "metadata": {                           // Metadata adicional
         "source": "camera_001"
     }
@@ -126,11 +126,11 @@ POST /api/smart-match
 {
     "query_embedding_hash": "a1b2c3d4",
     "search_performed": {
-        "company_id": "empresa_001",
+        "company_id": 123,
         "company_type": "private",
-        "camera_shared": true,
-        "search_unknown": true,
-        "auto_register": true,
+        "camera_shared": false,
+        "search_unknown": false,
+        "auto_register": false,
         "top_k": 5
     },
     "result_type": "found_known",
@@ -186,7 +186,7 @@ POST /api/smart-match
 
 1. **Nível 1 - Categoria**: `"public"` ou `"private"`
    - Baseado no `company_type` da empresa
-   - `"public"`: órgãos públicos (`company_type: "public_org"`)
+   - `"public"`: órgãos públicos (`company_type: "public"`)
    - `"private"`: empresas privadas (`company_type: "private"`)
 
 2. **Nível 2 - Company ID**: chave é o `company_id` real
@@ -267,7 +267,7 @@ GET /api/stats
 ### **3. Órgão Público - Câmera Privada**
 ```json
 {
-    "company_type": "public_org",
+    "company_type": "public",
     "camera_shared": false,
     "search_unknown": true,
     "auto_register": true
@@ -278,7 +278,7 @@ GET /api/stats
 ### **4. Órgão Público - Câmera Compartilhada**
 ```json
 {
-    "company_type": "public_org",
+    "company_type": "public",
     "camera_shared": true,
     "search_unknown": true, 
     "auto_register": true

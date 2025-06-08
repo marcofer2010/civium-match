@@ -6,14 +6,13 @@ import logging
 import sys
 from datetime import datetime
 from typing import Optional
-from pythonjsonlogger import jsonlogger
 
 from app.config import settings
 
 
 def setup_logger(name: str, log_file: Optional[str] = None) -> logging.Logger:
     """
-    Configura logger com formato JSON e níveis apropriados.
+    Configura logger com formato simples e níveis apropriados.
     
     Args:
         name: Nome do logger
@@ -25,15 +24,15 @@ def setup_logger(name: str, log_file: Optional[str] = None) -> logging.Logger:
     
     # Criar logger
     logger = logging.getLogger(name)
-    logger.setLevel(getattr(logging, settings.LOG_LEVEL.upper()))
+    logger.setLevel(logging.DEBUG if settings.DEBUG else logging.INFO)
     
     # Evitar duplicar handlers
     if logger.handlers:
         return logger
     
-    # Formatter para logs estruturados
-    formatter = jsonlogger.JsonFormatter(
-        fmt='%(asctime)s %(name)s %(levelname)s %(message)s',
+    # Formatter simples e legível
+    formatter = logging.Formatter(
+        fmt='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S'
     )
     
@@ -44,9 +43,13 @@ def setup_logger(name: str, log_file: Optional[str] = None) -> logging.Logger:
     
     # File handler (se especificado)
     if log_file:
-        file_handler = logging.FileHandler(log_file)
-        file_handler.setFormatter(formatter)
-        logger.addHandler(file_handler)
+        try:
+            file_handler = logging.FileHandler(log_file)
+            file_handler.setFormatter(formatter)
+            logger.addHandler(file_handler)
+        except Exception:
+            # Se não conseguir criar arquivo, continua só com console
+            pass
     
     # Evitar propagação para root logger
     logger.propagate = False
@@ -56,9 +59,9 @@ def setup_logger(name: str, log_file: Optional[str] = None) -> logging.Logger:
 
 def get_request_logger() -> logging.Logger:
     """Logger específico para requisições HTTP."""
-    return setup_logger("civium-match.requests", "logs/requests.log")
+    return setup_logger("civium-match.requests")
 
 
 def get_performance_logger() -> logging.Logger:
     """Logger específico para métricas de performance."""
-    return setup_logger("civium-match.performance", "logs/performance.log") 
+    return setup_logger("civium-match.performance") 

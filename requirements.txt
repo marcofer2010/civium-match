@@ -1,49 +1,15 @@
 # FastAPI e servidor
 fastapi==0.104.1
 uvicorn[standard]==0.24.0
-python-multipart==0.0.6
 
-# Processamento de dados
+# Processamento de arrays
 numpy==1.24.3
-scipy==1.11.4
 
-# Machine Learning e Computer Vision
-torch==2.1.0
-torchvision==0.16.0
-opencv-python==4.8.1.78
-Pillow==10.0.1
-
-# FAISS para busca de similaridade
+# FAISS para busca vetorial
 faiss-cpu==1.7.4
 
-# Validação e parsing
+# Validação de dados
 pydantic==2.5.0
-pydantic-settings==2.1.0
 
-# Database (se necessário para metadata)
-sqlalchemy==2.0.23
-alembic==1.13.1
-psycopg2-binary==2.9.9
-
-# Utilities
-python-json-logger==2.0.7
-requests==2.31.0
-python-dotenv==1.0.0
-
-# Monitoring e health check
-psutil==5.9.6
-
-# Data serialization
-joblib==1.3.2
-pickle5==0.0.12
-
-# Authentication (opcional)
-python-jose[cryptography]==3.3.0
-passlib[bcrypt]==1.7.4
-
-# Development
-pytest==7.4.3
-pytest-asyncio==0.21.1
-black==23.11.0
-flake8==6.1.0
-mypy==1.7.1 
+# Health check e monitoramento
+psutil==5.9.6 

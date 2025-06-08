@@ -22,7 +22,9 @@ from app.models.api_models import (
     SmartMatchRequest,
     SmartMatchResponse,
     AddFaceRequest,
-    AddFaceResponse
+    AddFaceResponse,
+    RemoveFaceRequest,
+    RemoveFaceResponse
 )
 from app.utils.logger import setup_logger
 
@@ -137,8 +139,7 @@ async def smart_match_faces(request: SmartMatchRequest):
             search_unknown=request.search_unknown,
             auto_register=request.auto_register,
             threshold=request.threshold,
-            top_k=request.top_k,
-            metadata=request.metadata
+            top_k=request.top_k
         )
         
         elapsed_time = (time.time() - start_time) * 1000
@@ -179,28 +180,25 @@ async def add_face(request: AddFaceRequest):
     
     try:
         logger.info(f"👤 Adding face: company={request.company_id}, type={request.company_type}, "
-                   f"collection={request.collection_type}, person_id={request.person_id}")
+                   f"collection={request.collection_type}")
         
         start_time = time.time()
         
-        face_id = await match_service.add_face_to_collection(
+        index_position = await match_service.add_face_to_collection(
             company_id=request.company_id,
             company_type=request.company_type,
             collection_type=request.collection_type,
-            embedding=request.embedding,
-            person_id=request.person_id,
-            metadata=request.metadata
+            embedding=request.embedding
         )
         
         elapsed_time = (time.time() - start_time) * 1000
         
-        logger.info(f"✅ Face added in {elapsed_time:.1f}ms: {face_id}")
+        logger.info(f"✅ Face added in {elapsed_time:.1f}ms: index_position {index_position}")
         
         return AddFaceResponse(
-            face_id=face_id,
+            index_position=index_position,
             company_id=request.company_id,
             collection_type=request.collection_type,
-            person_id=request.person_id,
             added_at=datetime.utcnow()
         )
         
@@ -209,6 +207,69 @@ async def add_face(request: AddFaceRequest):
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Erro ao adicionar face: {str(e)}"
+        )
+
+@app.delete("/api/faces", response_model=RemoveFaceResponse)
+async def remove_face(request: RemoveFaceRequest):
+    """
+    Remove uma face do sistema (soft delete).
+    
+    A face será marcada como removida na collection apropriada baseada em:
+    - company_id: ID da empresa/tenant
+    - company_type: 'public_org' ou 'private'
+    - collection_type: 'known' ou 'unknown'
+    - index_position: Posição no índice FAISS
+    
+    Args:
+        request: Dados da face a ser removida
+        
+    Returns:
+        Confirmação da remoção
+    """
+    if not match_service or not match_service.is_ready:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Match service não está pronto"
+        )
+    
+    try:
+        logger.info(f"🗑️ Removing face: company={request.company_id}, type={request.company_type}, "
+                   f"collection={request.collection_type}, index_position={request.index_position}")
+        
+        start_time = time.time()
+        
+        success = await match_service.remove_face_from_collection(
+            company_id=request.company_id,
+            company_type=request.company_type,
+            collection_type=request.collection_type,
+            index_position=request.index_position
+        )
+        
+        elapsed_time = (time.time() - start_time) * 1000
+        
+        if success:
+            logger.info(f"✅ Face removed in {elapsed_time:.1f}ms: index_position {request.index_position}")
+            
+            return RemoveFaceResponse(
+                success=True,
+                index_position=request.index_position,
+                company_id=request.company_id,
+                collection_type=request.collection_type,
+                removed_at=datetime.utcnow()
+            )
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Face na posição {request.index_position} não encontrada ou já removida"
+            )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Remove face error: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Erro ao remover face: {str(e)}"
         )
 
 @app.get("/api/stats")
