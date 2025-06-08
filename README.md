@@ -4,98 +4,64 @@ Serviço de match facial inteligente usando FAISS com arquitetura multi-tenant e
 
 ## 🚀 **Funcionalidades Principais**
 
-### **🧠 Smart Match - Busca em Cascata**
-Sistema inteligente de busca facial com controle granular por empresa e tipo de câmera:
+### **🧠 Smart Match - Busca em Cascata com Paths**
+Sistema inteligente de busca facial usando paths simplificados para identificar collections:
+
+**Path Format:** `company_type/company_id/collection_type`
+- **Exemplos:** `private/123/known`, `public/456/unknown`
 
 **Etapas da Busca:**
 1. **Collections 'Known'**: Busca pessoas conhecidas (federada se órgão público + câmera compartilhada)
 2. **Collection 'Unknown'**: Busca na própria empresa (se `search_unknown=True`)
 3. **Auto-Registro**: Cadastra automaticamente se não encontrar (se `auto_register=True`)
 
-### **🏢 Arquitetura Multi-Tenant**
+### **🏢 Arquitetura Multi-Tenant Simplificada**
 ```
 collections/
 ├── private/
-│   ├── empresa_001/
-│   │   ├── known.index       # Funcionários conhecidos
-│   │   ├── known.pkl
-│   │   ├── unknown.index     # Auto-detect
-│   │   └── unknown.pkl
+│   ├── 123/
+│   │   ├── known.index       # Apenas índice FAISS
+│   │   └── unknown.index     # Apenas índice FAISS
 └── public/
-    ├── policia_civil/
-    │   ├── known.index       # Criminosos/Pessoas de interesse
-    │   ├── known.pkl  
-    │   ├── unknown.index     # Auto-detect
-    │   └── unknown.pkl
-    └── policia_militar/
+    ├── 100/                  # Polícia Civil
+    │   ├── known.index       # Apenas índice FAISS
+    │   └── unknown.index     # Apenas índice FAISS
+    └── 200/                  # Polícia Federal
         ├── known.index
-        └── ...
+        └── unknown.index
 ```
 
-### **🏢 Lógica de Busca por Tipo de Empresa e Câmera**
-
-| Empresa | Câmera | Busca em Collections 'Known' |
-|---------|--------|------------------------------|
-| **Privada** | `camera_shared=false` | ✅ Apenas própria collection 'known' |
-| **Privada** | `camera_shared=true` | 🌐 **TODAS** as collections 'known' públicas + própria |
-| **Órgão Público** | `camera_shared=false` | ✅ Apenas própria collection 'known' |
-| **Órgão Público** | `camera_shared=true` | 🌐 **TODAS** as collections 'known' públicas + própria |
-
-**Exemplo:** Shopping center com câmera em área pública pode identificar criminosos procurados!
-
-### **📊 Matches Detalhados por Collection**
-
-Quando `camera_shared=true`, o sistema retorna matches organizados por **categoria** e **company**:
-
-**Nova Estrutura Simplificada:**
-```json
-{
-    "matches": {                        // Só presente quando há matches encontrados
-        "public": {
-            "policia_civil": [              // company_id do órgão público
-                {"index_position": 0, "similarity": 0.95, "confidence": 95.0},
-                {"index_position": 5, "similarity": 0.87, "confidence": 87.0}
-            ],
-            "policia_federal": [            // company_id do órgão público
-                {"index_position": 2, "similarity": 0.82, "confidence": 82.0}
-            ]
-        },
-        "private": {
-            "empresa_shopping": [           // company_id da empresa privada
-                {"index_position": 1, "similarity": 0.70, "confidence": 70.0}
-            ]
-        }
-    }
-}
+### **🗄️ Integração com PostgreSQL**
+```
+┌─────────────────┐    ┌─────────────────┐
+│   PostgreSQL    │    │     FAISS       │
+│                 │    │                 │
+│ face_id         │    │ index_position  │
+│ person_id       │    │ embedding_512d  │
+│ index_position  │◄──►│ similarity      │
+│ company_id      │    │                 │
+│ collection_type │    │                 │
+│ embedding       │    │                 │
+│ is_removed      │    │                 │
+│ created_at      │    │                 │
+│ metadata        │    │                 │
+└─────────────────┘    └─────────────────┘
 ```
 
-**⚡ Arquitetura de Microserviços:**
-- **civium-match**: Retorna apenas `index_position` (posição no índice FAISS)
-- **Outro container**: Faz mapeamento `index_position` → dados PostgreSQL (`person_id`, `metadata`, etc.)
-- **Benefício**: Separação clara de responsabilidades e performance otimizada
+**Responsabilidades:**
+- **FAISS**: Busca vetorial ultrarrápida, retorna `index_position`
+- **PostgreSQL**: Metadados, mapeamento `index_position` → dados reais
 
-**Quando o campo `matches` aparece:**
-- ✅ **`result_type: "found_known"`**: Faces encontradas nas collections 'known'
-- ✅ **`result_type: "found_unknown"`**: Faces encontradas na collection 'unknown' própria
-- ❌ **`result_type: "auto_registered"`**: Campo `matches` = `null` (nada encontrado)
-- ❌ **`result_type: "not_found"`**: Campo `matches` = `null` (nada encontrado)
+### **🌐 Lógica de Busca Federada**
 
-**Organização:**
-- `public` / `private`: **Categoria** baseada no `company_type`
-- `policia_civil`, `empresa_shopping`, etc.: **company_id** da empresa/órgão
-- Array de matches: **Resultados** encontrados nesta company
+| Company Type | Camera Shared | Busca em Collections 'Known' |
+|--------------|---------------|------------------------------|
+| **private** | `false` | ✅ Apenas própria collection 'known' |
+| **private** | `true` | ✅ Apenas própria collection 'known' |
+| **public** | `false` | ✅ Apenas própria collection 'known' |
+| **public** | `true` | 🌐 **TODAS** as collections 'known' públicas + própria |
 
-**Vantagens:**
-- ✅ **Organização clara**: Separação entre `public` e `private`
-- ✅ **Dados reais**: Apenas `face_id`, `similarity` e `confidence` (que existem no FAISS)
-- ✅ **Escalável**: Suporta múltiplas companies por categoria
-- ✅ **Performance**: Não requer consultas extras ao banco
-
-**Exemplo:** `top_k=3` + 4 companies = até **12 matches detalhados**
-- `public/policia_civil`: até 3 matches  
-- `public/policia_federal`: até 3 matches
-- `public/policia_militar`: até 3 matches
-- `private/empresa_shopping`: até 3 matches
+**Exemplo:** Órgão público com câmera compartilhada pode acessar base de dados de todos os órgãos públicos!
 
 ## 📚 **API Endpoints**
 
@@ -107,17 +73,13 @@ POST /api/smart-match
 **Request:**
 ```json
 {
-    "embedding": [0.1, 0.2, ...],           // 512 dimensões
-    "company_id": 123,
-    "company_type": "private",               // "private" ou "public"
+    "collection_path": "private/123/known",  // Path da collection base
+    "embedding": [0.1, 0.2, ...],          // 512 dimensões
     "camera_shared": false,                  // Câmera compartilhada?
-    "search_unknown": false,                  // Buscar em 'unknown'?
-    "auto_register": false,                   // Auto-cadastrar se não encontrar?
+    "search_unknown": true,                  // Buscar em 'unknown'?
+    "auto_register": true,                   // Auto-cadastrar se não encontrar?
     "threshold": 0.4,                        // Threshold de similaridade
-    "top_k": 5,                            // Máximo de resultados
-    "metadata": {                           // Metadata adicional
-        "source": "camera_001"
-    }
+    "top_k": 5                              // Máximo de resultados
 }
 ```
 
@@ -126,318 +88,251 @@ POST /api/smart-match
 {
     "query_embedding_hash": "a1b2c3d4",
     "search_performed": {
-        "company_id": 123,
-        "company_type": "private",
+        "collection_path": "private/123/known",
         "camera_shared": false,
-        "search_unknown": false,
-        "auto_register": false,
-        "top_k": 5
+        "search_unknown": true,
+        "auto_register": true
     },
     "result_type": "found_known",
-    
-    // Matches detalhados por categoria e company
     "matches": {
-        "public": {                         // Categoria: órgãos públicos
-            "policia_civil": [              // company_id
+        "private": {
+            "123": [
                 {
                     "index_position": 0,
                     "similarity": 0.95,
                     "confidence": 95.0
-                },
-                {
-                    "index_position": 5, 
-                    "similarity": 0.87,
-                    "confidence": 87.0
                 }
-                // ... mais até top_k
-            ],
-            "policia_federal": [            // company_id
-                {
-                    "index_position": 2,
-                    "similarity": 0.82,
-                    "confidence": 82.0
-                }
-                // ... mais até top_k
-            ]
-        },
-        "private": {                        // Categoria: empresas privadas
-            "empresa_001": [                // company_id
-                {
-                    "index_position": 1,
-                    "similarity": 0.75,
-                    "confidence": 75.0
-                }
-                // ... mais até top_k
             ]
         }
     },
-    
     "auto_registered_index": null,
-    "total_collections_searched": 4,
+    "total_collections_searched": 2,
     "search_time_ms": 45.2,
     "threshold_used": 0.4,
     "top_k_used": 5
 }
 ```
 
-### **📋 Estrutura da Resposta**
-
-**`matches`** é organizado em **2 níveis**:
-
-1. **Nível 1 - Categoria**: `"public"` ou `"private"`
-   - Baseado no `company_type` da empresa
-   - `"public"`: órgãos públicos (`company_type: "public"`)
-   - `"private"`: empresas privadas (`company_type: "private"`)
-
-2. **Nível 2 - Company ID**: chave é o `company_id` real
-   - Exemplos: `"policia_civil"`, `"empresa_shopping"`, `"policia_federal"`
-   - Cada `company_id` contém array de matches encontrados nesta empresa
-
-**Exemplo de navegação:**
-```javascript
-// Acessar matches da Polícia Civil
-const matchesPoliciaCivil = response.matches.public.policia_civil;
-
-// Acessar matches de empresa privada  
-const matchesEmpresa = response.matches.private.empresa_shopping;
-
-// Iterar todas as categories e companies
-for (const [category, companies] of Object.entries(response.matches)) {
-    console.log(`Categoria: ${category}`); // "public" ou "private"
-    
-    for (const [companyId, matches] of Object.entries(companies)) {
-        console.log(`  Company: ${companyId}`);  // company_id real
-        console.log(`  Matches: ${matches.length}`);
-    }
-}
-```
-
 ### **👤 Adicionar Face**
 ```http
-POST /api/faces
+POST /api/v2/faces
 ```
 
 **Request:**
 ```json
 {
-    "embedding": [0.1, 0.2, ...],
-    "company_id": "empresa_001",
-    "company_type": "private",
-    "collection_type": "known",              // "known" ou "unknown"
-    "person_id": "pessoa_001",               // Opcional
-    "metadata": {
-        "name": "João Silva",
-        "role": "funcionario"
-    }
+    "collection_path": "private/123/known",
+    "embedding": [0.1, 0.2, ...]
 }
 ```
 
-### **📊 Health Check**
-```http
-GET /health
+**Response:**
+```json
+{
+    "index_position": 5,
+    "collection_path": "private/123/known",
+    "added_at": "2024-01-15T10:30:00Z"
+}
 ```
 
-### **📈 Estatísticas**
+### **🗑️ Remover Face (Soft Delete)**
+```http
+DELETE /api/v2/faces
+```
+
+**Request:**
+```json
+{
+    "collection_path": "private/123/known",
+    "index_position": 5
+}
+```
+
+**Response:**
+```json
+{
+    "success": true,
+    "collection_path": "private/123/known",
+    "index_position": 5,
+    "removed_at": "2024-01-15T10:35:00Z"
+}
+```
+
+**⚠️ Importante:** FAISS não suporta remoção real. Marque como removida no PostgreSQL!
+
+### **📊 Estatísticas**
 ```http
 GET /api/stats
 ```
 
+**Response:**
+```json
+{
+    "uptime_seconds": 3600.5,
+    "total_smart_matches": 1250,
+    "total_collections": 12,
+    "total_faces": 5430,
+    "average_match_time_ms": 23.8,
+    "auto_registrations": 89,
+    "memory_usage_mb": 512.3
+}
+```
+
+### **🏥 Health Check**
+```http
+GET /health
+```
+
 ## 🎯 **Cenários de Uso**
 
-### **1. Empresa Privada - Busca Restrita**
-```json
+### **1. Empresa Privada - Busca Isolada**
+```python
+# Buscar apenas na própria base
 {
-    "company_type": "private",
-    "search_unknown": false,
-    "auto_register": false
+    "collection_path": "private/123/known",
+    "embedding": [...],
+    "camera_shared": false,     # Não importa para empresas privadas
+    "search_unknown": True,     # Buscar também em unknown
+    "auto_register": True       # Auto-registrar se não encontrar
 }
 ```
-**Comportamento:** Busca apenas na collection 'known' da própria empresa.
 
-### **2. Empresa Privada - Busca Completa**
-```json
+### **2. Órgão Público - Busca Federada**
+```python
+# Buscar em todas as bases públicas
 {
-    "company_type": "private", 
-    "search_unknown": true,
-    "auto_register": true
+    "collection_path": "public/100/known", 
+    "embedding": [...],
+    "camera_shared": True,      # ATIVA busca federada
+    "search_unknown": False,    # Não buscar em unknown
+    "auto_register": False      # Não auto-registrar
 }
 ```
-**Comportamento:** Busca 'known' → 'unknown' próprias → auto-cadastra.
 
-### **3. Órgão Público - Câmera Privada**
-```json
+### **3. Fluxo Completo com PostgreSQL**
+```python
+# 1. Adicionar face
+POST /api/v2/faces
 {
-    "company_type": "public",
-    "camera_shared": false,
-    "search_unknown": true,
-    "auto_register": true
+    "collection_path": "private/123/unknown",
+    "embedding": [...]
 }
-```
-**Comportamento:** Busca apenas collections próprias (como empresa privada).
+# Response: {"index_position": 42}
 
-### **4. Órgão Público - Câmera Compartilhada**
-```json
+# 2. Salvar no PostgreSQL
+INSERT INTO faces (face_id, person_id, index_position, collection_path, embedding, company_id)
+VALUES ('uuid', 'person_123', 42, 'private/123/unknown', [...], 123);
+
+# 3. Buscar face
+POST /api/smart-match
 {
-    "company_type": "public",
-    "camera_shared": true,
-    "search_unknown": true, 
-    "auto_register": true
+    "collection_path": "private/123/known",
+    "embedding": [...],
+    "search_unknown": True
 }
-```
-**Comportamento:** 🌐 **Busca federada** em TODAS as collections 'known' públicas → 'unknown' própria → auto-cadastra.
+# Response: {"matches": {"private": {"123": [{"index_position": 42, ...}]}}}
 
-## 🛠️ **Instalação e Execução**
-
-### **Pré-requisitos**
-```bash
-# Python 3.11+ e pip
-pip install -r requirements.txt
+# 4. Mapear resultado
+SELECT face_id, person_id, metadata 
+FROM faces 
+WHERE index_position = 42 AND collection_path = 'private/123/unknown';
 ```
 
-### **Executar Serviço**
-```bash
-# Desenvolvimento
-python main.py
-
-# Produção
-uvicorn main:app --host 0.0.0.0 --port 8002
-```
+## 🚀 **Executar**
 
 ### **Docker**
 ```bash
-# Build
+# Build e run
 docker build -t civium-match .
+docker run -p 8000:8000 civium-match
 
-# Run
-docker run -p 8002:8002 -v $(pwd)/collections:/app/collections civium-match
+# Com variáveis de ambiente
+docker run -p 8000:8000 -e DEBUG=true civium-match
+```
+
+### **Local**
+```bash
+# Instalar dependências
+pip install -r requirements.txt
+
+# Executar
+python main.py
+
+# Executar com reload (desenvolvimento)
+uvicorn main:app --reload --host 0.0.0.0 --port 8000
 ```
 
 ### **Teste**
 ```bash
-# Testar funcionalidades
-python test_smart_match.py
+# Testar endpoints com paths
+python test_path_api.py
 
-# Teste básico
+# Testes existentes
 python test_basic.py
+python test_smart_match.py
 ```
 
-## ⚙️ **Configuração**
+## 🔧 **Configuração**
 
 ### **Variáveis de Ambiente**
 ```bash
 # .env
-DEBUG=true
+DEBUG=false
 LOG_LEVEL=INFO
-HOST=0.0.0.0
-PORT=8002
-EMBEDDING_DIMENSION=512
-DEFAULT_MATCH_THRESHOLD=0.4
-DEFAULT_TOP_K=10
+COLLECTIONS_DIR=./collections
+MAX_COLLECTIONS_CACHE=100
 ALLOWED_ORIGINS=["*"]
 ```
 
-### **Ajustar Parâmetros**
-```python
-# app/config.py
-class Settings:
-    DEFAULT_MATCH_THRESHOLD: float = 0.4    # Threshold padrão
-    DEFAULT_TOP_K: int = 10                  # Resultados padrão
-    EMBEDDING_DIMENSION: int = 512           # Dimensão dos embeddings
+### **Estrutura do Projeto**
+```
+civium-match/
+├── main.py                 # FastAPI app
+├── app/
+│   ├── models/
+│   │   └── api_models.py   # Modelos Pydantic
+│   ├── services/
+│   │   └── match_service.py # Lógica de match e collections
+│   ├── utils/
+│   │   └── logger.py       # Configuração de logging
+│   └── config.py           # Configurações
+├── collections/            # Armazenamento FAISS (auto-criado)
+│   ├── private/
+│   │   └── 123/
+│   │       ├── known.index
+│   │       └── unknown.index
+│   └── public/
+│       └── 100/
+│           ├── known.index
+│           └── unknown.index
+├── tests/
+├── Dockerfile
+├── requirements.txt
+└── README.md
 ```
 
-## 📊 **Performance**
+## 📋 **Response Types**
 
-### **Otimizações FAISS**
-- **IndexFlatIP**: Produto interno para similaridade cosseno
-- **Busca Paralela**: Multiple collections em paralelo
-- **Cache de Collections**: Collections ficam em memória
-- **Lazy Loading**: Collections carregadas sob demanda
+| `result_type` | Descrição | `matches` | `auto_registered_index` |
+|---------------|-----------|-----------|------------------------|
+| `found_known` | Encontrado em collection 'known' | ✅ Presente | `null` |
+| `found_unknown` | Encontrado em collection 'unknown' própria | ✅ Presente | `null` |
+| `auto_registered` | Auto-registrado em 'unknown' | `null` | ✅ Presente |
+| `not_found` | Não encontrado | `null` | `null` |
 
-### **Benchmarks Típicos**
-- **Busca Simples**: ~5-15ms (1 collection, 1K faces)
-- **Busca Federada**: ~20-50ms (5 collections públicas)
-- **Auto-Registro**: ~10-25ms (criação + adição)
+## 🎯 **Benefícios da Arquitetura Simplificada**
 
-## 🔧 **Integração com Worker**
+✅ **Performance**: FAISS puro sem overhead de metadados  
+✅ **Simplicidade**: Apenas arquivos `.index`, sem `.pkl`  
+✅ **Flexibilidade**: PostgreSQL gerencia todos os metadados  
+✅ **Escalabilidade**: Separação clara de responsabilidades  
+✅ **Manutenibilidade**: Código mais limpo e focado  
+✅ **Consistência**: Paths uniformes em toda a API  
 
-Para integrar com o `facial_recognition_worker.py`:
+## ⚠️ **Limitações Importantes**
 
-```python
-# Substituir lógica de identificação existente
-async def identify_face_via_match_service(embedding: np.ndarray, 
-                                        company_id: str, 
-                                        company_type: str,
-                                        camera_shared: bool = False) -> Dict:
-    """Usar civium-match service para identificação."""
-    
-    match_request = {
-        "embedding": embedding.tolist(),
-        "company_id": company_id,
-        "company_type": company_type,
-        "camera_shared": camera_shared,
-        "search_unknown": True,      # Buscar em unknown
-        "auto_register": True,       # Auto-cadastrar
-        "threshold": 0.4
-    }
-    
-    response = requests.post(
-        "http://civium-match:8002/api/smart-match",
-        json=match_request,
-        timeout=30
-    )
-    
-    if response.status_code == 200:
-        result = response.json()
-        
-        if result["result_type"] == "found_known":
-            return {
-                "action": "identified",
-                "identified": True,
-                "face_id": result["match"]["face_id"],
-                "person_id": result["match"]["person_id"],
-                "confidence": result["match"]["confidence"]
-            }
-        elif result["result_type"] == "auto_registered":
-            return {
-                "action": "auto_detected", 
-                "identified": False,
-                "face_id": result["auto_registered_face_id"]
-            }
-        else:
-            return {
-                "action": "not_found",
-                "identified": False
-            }
-```
+❌ **Sem Remoção Real**: FAISS não suporta remoção de vetores  
+❌ **Sem Transferência**: Use PostgreSQL para mover faces entre collections  
+❌ **Sem Metadados**: Todos os metadados devem estar no PostgreSQL  
 
-## 🎛️ **Controle de Comportamento**
-
-| Parâmetro | Descrição | Casos de Uso |
-|-----------|-----------|--------------|
-| `search_unknown` | Buscar na collection 'unknown' da empresa | Evitar duplicatas, otimizar performance |
-| `auto_register` | Cadastrar automaticamente se não encontrar | Empresas que querem auto-detecção vs. apenas verificação |
-| `camera_shared` | Ativar busca federada para órgãos públicos | Câmeras em locais públicos vs. privados |
-| `company_type` | Tipo da empresa/órgão | Determinar se pode participar de busca federada |
-
-## 📋 **Roadmap**
-
-- [ ] Cache Redis para performance
-- [ ] Índices FAISS otimizados (IVF, HNSW)
-- [ ] Métricas detalhadas (Prometheus)
-- [ ] Backup/restore de collections
-- [ ] Interface web de administração
-- [ ] Clustering para alta disponibilidade
-
-## 🤝 **Contribuição**
-
-Este serviço é parte do ecossistema Civium. Para contribuições:
-
-1. Fork o repositório
-2. Crie uma branch: `git checkout -b feature/nova-funcionalidade`
-3. Commit: `git commit -m 'Adiciona nova funcionalidade'`
-4. Push: `git push origin feature/nova-funcionalidade`
-5. Abra um Pull Request
-
----
-
-**Civium Match Service** - Reconhecimento facial inteligente com arquitetura multi-tenant 🎯 
+**Solução:** Marque faces como removidas no PostgreSQL e ignore nas buscas! 

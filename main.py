@@ -21,14 +21,11 @@ from app.models.api_models import (
     HealthResponse,
     SmartMatchRequest,
     SmartMatchResponse,
-    AddFaceRequest,
-    AddFaceResponse,
-    RemoveFaceRequest,
-    RemoveFaceResponse,
-    PromoteFaceRequest,
-    PromoteFaceResponse,
-    DemoteFaceRequest,
-    DemoteFaceResponse
+    # Modelos para paths
+    AddFaceByPathRequest,
+    AddFaceByPathResponse,
+    RemoveFaceByPathRequest,
+    RemoveFaceByPathResponse
 )
 from app.utils.logger import setup_logger
 
@@ -109,14 +106,15 @@ async def smart_match_faces(request: SmartMatchRequest):
     Realizar match inteligente com busca em cascata.
     
     Etapas:
-    1. Buscar em collections 'known' (federada se camera_shared=True)
-       - Se camera_shared=True: busca em TODAS as collections 'known' públicas + própria
-       - Se camera_shared=False: busca apenas na própria collection 'known'
-    2. Se não encontrar e search_unknown=True, buscar na collection 'unknown' da própria empresa
-    3. Se não encontrar e auto_register=True, cadastrar na collection 'unknown' da própria empresa
+    1. Parse do collection_path para extrair company_type, company_id
+    2. Buscar em collections 'known' (federada se camera_shared=True e public)
+       - Se camera_shared=True e company_type=public: busca em TODAS as collections 'known' públicas + própria
+       - Caso contrário: busca apenas na própria collection 'known'
+    3. Se não encontrar e search_unknown=True, buscar na collection 'unknown' da própria empresa
+    4. Se não encontrar e auto_register=True, cadastrar na collection 'unknown' da própria empresa
     
     Args:
-        request: Dados da requisição com embedding e parâmetros de controle
+        request: Dados da requisição com embedding, collection_path e parâmetros de controle
         
     Returns:
         Resultado inteligente do match com informações detalhadas da busca
@@ -128,7 +126,10 @@ async def smart_match_faces(request: SmartMatchRequest):
         )
     
     try:
-        logger.info(f"🧠 Smart match: company={request.company_id}, type={request.company_type}, "
+        # Parse do collection_path
+        company_type, company_id, _ = match_service._parse_collection_path(request.collection_path)
+        
+        logger.info(f"🧠 Smart match: path={request.collection_path}, "
                    f"shared={request.camera_shared}, search_unknown={request.search_unknown}, "
                    f"auto_register={request.auto_register}")
         
@@ -137,8 +138,8 @@ async def smart_match_faces(request: SmartMatchRequest):
         # Realizar smart match
         result = await match_service.smart_match(
             embedding=request.embedding,
-            company_id=request.company_id,
-            company_type=request.company_type,
+            company_id=company_id,
+            company_type=company_type,
             camera_shared=request.camera_shared,
             search_unknown=request.search_unknown,
             auto_register=request.auto_register,
@@ -160,122 +161,6 @@ async def smart_match_faces(request: SmartMatchRequest):
             detail=f"Erro no smart match: {str(e)}"
         )
 
-@app.post("/api/faces", response_model=AddFaceResponse)
-async def add_face(request: AddFaceRequest):
-    """
-    Adicionar uma face ao sistema.
-    
-    A face será automaticamente adicionada à collection apropriada baseada em:
-    - company_id: ID da empresa/tenant
-    - company_type: 'public_org' ou 'private'
-    - collection_type: 'known' ou 'unknown'
-    
-    Args:
-        request: Dados da face a ser adicionada
-        
-    Returns:
-        Informações da face adicionada
-    """
-    if not match_service or not match_service.is_ready:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Match service não está pronto"
-        )
-    
-    try:
-        logger.info(f"👤 Adding face: company={request.company_id}, type={request.company_type}, "
-                   f"collection={request.collection_type}")
-        
-        start_time = time.time()
-        
-        index_position = await match_service.add_face_to_collection(
-            company_id=request.company_id,
-            company_type=request.company_type,
-            collection_type=request.collection_type,
-            embedding=request.embedding
-        )
-        
-        elapsed_time = (time.time() - start_time) * 1000
-        
-        logger.info(f"✅ Face added in {elapsed_time:.1f}ms: index_position {index_position}")
-        
-        return AddFaceResponse(
-            index_position=index_position,
-            company_id=request.company_id,
-            collection_type=request.collection_type,
-            added_at=datetime.utcnow()
-        )
-        
-    except Exception as e:
-        logger.error(f"❌ Add face error: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Erro ao adicionar face: {str(e)}"
-        )
-
-@app.delete("/api/faces", response_model=RemoveFaceResponse)
-async def remove_face(request: RemoveFaceRequest):
-    """
-    Remove uma face do sistema (soft delete).
-    
-    A face será marcada como removida na collection apropriada baseada em:
-    - company_id: ID da empresa/tenant
-    - company_type: 'public_org' ou 'private'
-    - collection_type: 'known' ou 'unknown'
-    - index_position: Posição no índice FAISS
-    
-    Args:
-        request: Dados da face a ser removida
-        
-    Returns:
-        Confirmação da remoção
-    """
-    if not match_service or not match_service.is_ready:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Match service não está pronto"
-        )
-    
-    try:
-        logger.info(f"🗑️ Removing face: company={request.company_id}, type={request.company_type}, "
-                   f"collection={request.collection_type}, index_position={request.index_position}")
-        
-        start_time = time.time()
-        
-        success = await match_service.remove_face_from_collection(
-            company_id=request.company_id,
-            company_type=request.company_type,
-            collection_type=request.collection_type,
-            index_position=request.index_position
-        )
-        
-        elapsed_time = (time.time() - start_time) * 1000
-        
-        if success:
-            logger.info(f"✅ Face removed in {elapsed_time:.1f}ms: index_position {request.index_position}")
-            
-            return RemoveFaceResponse(
-                success=True,
-                index_position=request.index_position,
-                company_id=request.company_id,
-                collection_type=request.collection_type,
-                removed_at=datetime.utcnow()
-            )
-        else:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Face na posição {request.index_position} não encontrada ou já removida"
-            )
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"❌ Remove face error: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Erro ao remover face: {str(e)}"
-        )
-
 @app.get("/api/stats")
 async def get_service_stats():
     """Obter estatísticas do serviço."""
@@ -287,19 +172,23 @@ async def get_service_stats():
     
     return await match_service.get_stats()
 
-@app.post("/api/faces/promote", response_model=PromoteFaceResponse)
-async def promote_face(request: PromoteFaceRequest):
+# ==========================================
+# NOVOS ENDPOINTS COM PATHS DE COLLECTIONS
+# ==========================================
+
+@app.post("/api/v2/faces", response_model=AddFaceByPathResponse)
+async def add_face_by_path(request: AddFaceByPathRequest):
     """
-    Promove uma face de 'unknown' para 'known'.
+    Adicionar face usando path da collection.
     
-    Move uma face da collection 'unknown' para a collection 'known' da mesma empresa.
-    Útil quando uma pessoa desconhecida é identificada.
+    O path deve ter o formato: company_type/company_id/collection_type
+    Exemplo: "private/123/known" ou "public/456/unknown"
     
     Args:
-        request: Dados da face a ser promovida
+        request: Dados da face com path da collection
         
     Returns:
-        Resultado da promoção com novas posições
+        Informações da face adicionada
     """
     if not match_service or not match_service.is_ready:
         raise HTTPException(
@@ -308,58 +197,42 @@ async def promote_face(request: PromoteFaceRequest):
         )
     
     try:
-        logger.info(f"🔼 Promoting face: company={request.company_id}, type={request.company_type}, "
-                   f"from_position={request.from_index_position}")
+        logger.info(f"👤 Adding face by path: {request.collection_path}")
         
         start_time = time.time()
         
-        result = await match_service.promote_face(
-            company_id=request.company_id,
-            company_type=request.company_type,
-            from_index_position=request.from_index_position
+        index_position = await match_service.add_face_by_path(
+            collection_path=request.collection_path,
+            embedding=request.embedding
         )
         
         elapsed_time = (time.time() - start_time) * 1000
         
-        if result["success"]:
-            logger.info(f"✅ Face promoted in {elapsed_time:.1f}ms: "
-                       f"unknown[{result['old_index_position']}] → known[{result['new_index_position']}]")
-            
-            return PromoteFaceResponse(
-                success=True,
-                old_index_position=result["old_index_position"],
-                new_index_position=result["new_index_position"],
-                company_id=request.company_id,
-                promoted_at=result["promoted_at"]
-            )
-        else:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=result.get("error", "Falha na promoção da face")
-            )
+        logger.info(f"✅ Face added by path in {elapsed_time:.1f}ms: {request.collection_path}[{index_position}]")
         
-    except HTTPException:
-        raise
+        return AddFaceByPathResponse(
+            index_position=index_position,
+            collection_path=request.collection_path,
+            added_at=datetime.utcnow()
+        )
+        
     except Exception as e:
-        logger.error(f"❌ Promote face error: {e}")
+        logger.error(f"❌ Add face by path error: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Erro ao promover face: {str(e)}"
+            detail=f"Erro ao adicionar face: {str(e)}"
         )
 
-@app.post("/api/faces/demote", response_model=DemoteFaceResponse)
-async def demote_face(request: DemoteFaceRequest):
+@app.delete("/api/v2/faces", response_model=RemoveFaceByPathResponse)
+async def remove_face_by_path(request: RemoveFaceByPathRequest):
     """
-    Rebaixa uma face de 'known' para 'unknown'.
-    
-    Move uma face da collection 'known' para a collection 'unknown' da mesma empresa.
-    Útil para correções ou mudanças de status.
+    Remover face usando path da collection.
     
     Args:
-        request: Dados da face a ser rebaixada
+        request: Path da collection e posição no índice
         
     Returns:
-        Resultado do rebaixamento com novas posições
+        Confirmação da remoção
     """
     if not match_service or not match_service.is_ready:
         raise HTTPException(
@@ -368,46 +241,41 @@ async def demote_face(request: DemoteFaceRequest):
         )
     
     try:
-        logger.info(f"🔽 Demoting face: company={request.company_id}, type={request.company_type}, "
-                   f"from_position={request.from_index_position}")
+        logger.info(f"🗑️ Removing face by path: {request.collection_path}[{request.index_position}]")
         
         start_time = time.time()
         
-        result = await match_service.demote_face(
-            company_id=request.company_id,
-            company_type=request.company_type,
-            from_index_position=request.from_index_position
+        success = await match_service.remove_face_by_path(
+            collection_path=request.collection_path,
+            index_position=request.index_position
         )
         
         elapsed_time = (time.time() - start_time) * 1000
         
-        if result["success"]:
-            logger.info(f"✅ Face demoted in {elapsed_time:.1f}ms: "
-                       f"known[{result['old_index_position']}] → unknown[{result['new_index_position']}]")
-            
-            return DemoteFaceResponse(
+        if success:
+            logger.info(f"✅ Face removed by path in {elapsed_time:.1f}ms")
+            return RemoveFaceByPathResponse(
                 success=True,
-                old_index_position=result["old_index_position"],
-                new_index_position=result["new_index_position"],
-                company_id=request.company_id,
-                demoted_at=result["demoted_at"]
+                collection_path=request.collection_path,
+                index_position=request.index_position,
+                removed_at=datetime.utcnow()
             )
         else:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=result.get("error", "Falha no rebaixamento da face")
-            )
-        
-    except HTTPException:
-        raise
+            raise ValueError("Falha ao remover face")
+            
     except Exception as e:
-        logger.error(f"❌ Demote face error: {e}")
+        logger.error(f"❌ Remove face by path error: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Erro ao rebaixar face: {str(e)}"
+            detail=f"Erro ao remover face: {str(e)}"
         )
 
-# Exception handlers
+
+
+# ==========================================
+# EXCEPTION HANDLER
+# ==========================================
+
 @app.exception_handler(Exception)
 async def global_exception_handler(request, exc):
     """Handler global para exceções não tratadas."""

@@ -5,13 +5,11 @@ Serviço principal de match FAISS para o Civium Match Service
 import asyncio
 import hashlib
 import time
-import uuid
 from datetime import datetime
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Set
 import os
 import numpy as np
 import faiss
-import pickle
 import psutil
 
 from app.config import settings
@@ -22,247 +20,197 @@ from app.models.api_models import (
 )
 from app.utils.logger import setup_logger
 
+# Logger global para a Collection
+logger = setup_logger("collection")
+
 
 class Collection:
-    """Representa uma collection de faces."""
+    """Collection FAISS com sistema de invalidação local."""
     
-    def __init__(self, company_id: int, company_type: str, collection_type: str, 
-                 metadata: Optional[Dict] = None):
+    def __init__(self, company_id: int, company_type: str, collection_type: str):
         self.company_id = company_id
-        self.company_type = company_type  # 'public' ou 'private'
-        self.collection_type = collection_type  # 'known' ou 'unknown'
-        self.metadata = metadata or {}
-        self.created_at = datetime.utcnow()
-        self.updated_at = None
-        self.face_count = 0
-        self.was_just_created = False
-        
-        # Logger
-        self.logger = setup_logger(f"collection-{self.collection_key}")
-        
-        # FAISS index para esta collection
-        self.index: Optional[faiss.Index] = None
-        self.face_id_mapping: Dict[int, str] = {}  # Mapear index_position para face_id
-        self.face_ids: List[str] = []  # Mapear posição no index para face_id
-        self.face_metadata: Dict[str, Dict] = {}  # Metadata por face_id
-        
-        # Soft delete - posições marcadas como removidas
-        self.removed_positions: set = set()  # Set de index_positions removidas
-        
+        self.company_type = company_type
+        self.collection_type = collection_type
+        self.index = None
+        self.invalidated_positions: Set[int] = set()  # Posições invalidadas localmente
         self._initialize_index()
     
     @property
     def collection_key(self) -> str:
         """Chave única da collection."""
-        tenant_category = "public" if self.company_type == "public" else "private"
-        return f"{tenant_category}/{self.company_id}/{self.collection_type}"
+        return f"{self.company_type}_{self.company_id}_{self.collection_type}"
     
     @property
     def collection_path(self) -> str:
-        """Caminho da collection no filesystem."""
-        tenant_category = "public" if self.company_type == "public" else "private"
-        return f"collections/{tenant_category}/{str(self.company_id)}/{self.collection_type}"
+        """Path do arquivo FAISS no sistema."""
+        return f"collections/{self.company_type}/{self.company_id}/{self.collection_type}"
     
     def _initialize_index(self):
-        """Inicializa o índice FAISS para esta collection."""
-        # Usar índice flat para começar (pode ser otimizado depois)
-        self.index = faiss.IndexFlatIP(settings.EMBEDDING_DIMENSION)
-        # Para busca por similaridade cosseno, normalizar embeddings
-        
-    def add_face(self, embedding: np.ndarray, face_id: str) -> None:
-        """
-        Adiciona uma face à collection.
-        
-        Args:
-            embedding: Embedding da face
-            face_id: ID único da face
-        """
-        if self.index is None:
-            self._initialize_index()
-        
-        # Adicionar ao índice FAISS
-        embedding_2d = embedding.reshape(1, -1).astype(np.float32)
-        self.index.add(embedding_2d)
-        
-        # Mapear posição no índice para face_id
-        index_position = self.index.ntotal - 1
-        self.face_id_mapping[index_position] = face_id
-        self.face_ids.append(face_id)
-        self.face_metadata[face_id] = {
-            'added_at': datetime.utcnow()
-        }
-        
-        self.face_count += 1
-        self.updated_at = datetime.utcnow()
-        
-        self.logger.debug(f"Face {face_id} adicionada à collection {self.collection_key} na posição {index_position}")
-        
-        # Salvar automaticamente
-        self.save_to_disk()
+        """Inicializar índice FAISS."""
+        # IndexFlatIP para similaridade coseno (produto interno)
+        self.index = faiss.IndexFlatIP(512)  # 512 dimensões
     
-    def remove_face(self, index_position: int) -> bool:
+    def add_face(self, embedding: np.ndarray) -> int:
         """
-        Remove uma face da collection (soft delete).
+        Adicionar embedding ao índice FAISS.
+        
+        Returns:
+            index_position: Posição no índice FAISS (para gravar no PostgreSQL)
+        """
+        # Validar embedding
+        if embedding.shape[0] != 512:
+            raise ValueError(f"Embedding deve ter 512 dimensões, recebeu {embedding.shape[0]}")
+        
+        # Validar que não é vetor zero (má prática!)
+        if np.allclose(embedding, 0):
+            raise ValueError("Embedding não pode ser vetor zero! Use invalidate_position() para invalidar.")
+        
+        # Normalizar para similaridade coseno
+        embedding = embedding / np.linalg.norm(embedding)
+        
+        # Posição que será ocupada (antes de adicionar)
+        index_position = self.index.ntotal
+        
+        # Adicionar ao FAISS
+        self.index.add(embedding.reshape(1, -1))
+        
+        return index_position
+    
+    def invalidate_position(self, index_position: int) -> bool:
+        """
+        Invalidar uma posição específica.
+        
+        Em vez de alterar o FAISS (impossível), mantemos uma lista local
+        de posições invalidadas e filtramos nos resultados.
         
         Args:
-            index_position: Posição no índice FAISS
+            index_position: Posição no índice FAISS para invalidar
             
         Returns:
-            True se removido com sucesso, False se não encontrado
+            True se invalidou com sucesso
         """
-        if index_position < 0 or index_position >= self.face_count:
-            self.logger.warning(f"Posição inválida para remoção: {index_position}")
+        if index_position < 0 or index_position >= self.index.ntotal:
             return False
             
-        if index_position in self.removed_positions:
-            self.logger.warning(f"Face na posição {index_position} já está removida")
-            return False
-        
-        # Marcar como removida (soft delete)
-        self.removed_positions.add(index_position)
-        
-        # Remover metadata se existir
-        if index_position in self.face_id_mapping:
-            face_id = self.face_id_mapping[index_position]
-            if face_id in self.face_metadata:
-                del self.face_metadata[face_id]
-        
-        self.updated_at = datetime.utcnow()
-        
-        self.logger.info(f"Face na posição {index_position} marcada como removida (soft delete)")
-        
-        # Salvar alterações
-        self.save_to_disk()
-        
+        self.invalidated_positions.add(index_position)
         return True
     
+    def revalidate_position(self, index_position: int) -> bool:
+        """
+        Revalidar uma posição (remover da lista de invalidadas).
+        
+        Args:
+            index_position: Posição para revalidar
+            
+        Returns:
+            True se revalidou com sucesso
+        """
+        if index_position in self.invalidated_positions:
+            self.invalidated_positions.remove(index_position)
+            return True
+        return False
+    
     def search(self, embedding: np.ndarray, top_k: int = 10, threshold: float = 0.4) -> List[Dict]:
-        """Busca faces similares na collection."""
-        if self.face_count == 0:
+        """
+        Buscar embeddings similares, filtrando posições invalidadas.
+        
+        Returns:
+            Lista de matches com index_position, similarity e confidence (sem invalidadas)
+        """
+        if self.index.ntotal == 0:
             return []
         
         # Normalizar query embedding
-        query_embedding = embedding.astype(np.float32)
-        faiss.normalize_L2(query_embedding.reshape(1, -1))
+        embedding = embedding / np.linalg.norm(embedding)
         
-        # Buscar mais resultados para compensar faces removidas
-        search_k = min(top_k * 3, self.face_count)  # Buscar 3x mais para filtrar removidas
-        similarities, indices = self.index.search(query_embedding.reshape(1, -1), search_k)
+        # Buscar mais resultados para compensar filtros
+        search_k = min(top_k * 3, self.index.ntotal)  # 3x mais para filtrar
+        similarities, indices = self.index.search(embedding.reshape(1, -1), search_k)
         
         results = []
-        for i, (similarity, index) in enumerate(zip(similarities[0], indices[0])):
-            if index == -1:  # Fim dos resultados válidos
-                break
+        for i, (similarity, index_position) in enumerate(zip(similarities[0], indices[0])):
+            # Filtrar: threshold, posições válidas e NÃO invalidadas
+            if (similarity >= threshold and 
+                index_position != -1 and 
+                index_position not in self.invalidated_positions):
                 
-            if similarity < threshold:  # Abaixo do threshold
-                continue
+                confidence = min(similarity * 100, 100.0)
+                results.append({
+                    "index_position": int(index_position),
+                    "similarity": float(similarity),
+                    "confidence": float(confidence)
+                })
                 
-            # FILTRAR POSIÇÕES REMOVIDAS (soft delete)
-            if index in self.removed_positions:
-                continue
-            
-            results.append({
-                'index_position': int(index),  # Retornar posição no índice FAISS
-                'similarity': float(similarity),
-                'confidence': float(similarity * 100)  # Converter para percentual
-            })
-            
-            # Parar quando atingir top_k resultados válidos
-            if len(results) >= top_k:
-                break
+                # Parar quando tivermos resultados suficientes
+                if len(results) >= top_k:
+                    break
         
         return results
     
     def save_to_disk(self) -> None:
-        """Salva collection em disco."""
-        directory = os.path.dirname(self.collection_path)
-        os.makedirs(directory, exist_ok=True)
+        """Salvar índice FAISS e posições invalidadas."""
+        import os
+        import pickle
+        
+        # Criar diretório se não existir
+        dir_path = f"collections/{self.company_type}/{self.company_id}"
+        os.makedirs(dir_path, exist_ok=True)
         
         # Salvar índice FAISS
         index_path = f"{self.collection_path}.index"
         faiss.write_index(self.index, index_path)
         
-        # Salvar metadata
-        metadata_path = f"{self.collection_path}.pkl"
-        with open(metadata_path, 'wb') as f:
-            pickle.dump({
-                'company_id': self.company_id,
-                'company_type': self.company_type,
-                'collection_type': self.collection_type,
-                'metadata': self.metadata,
-                'created_at': self.created_at,
-                'updated_at': self.updated_at,
-                'face_count': self.face_count,
-                'face_ids': self.face_ids,
-                'face_id_mapping': self.face_id_mapping,
-                'face_metadata': self.face_metadata,
-                'removed_positions': self.removed_positions
-            }, f)
+        # Salvar posições invalidadas (se houver)
+        if self.invalidated_positions:
+            invalidated_path = f"{self.collection_path}.invalidated"
+            with open(invalidated_path, 'wb') as f:
+                pickle.dump(self.invalidated_positions, f)
     
     @classmethod
     def load_from_disk(cls, company_id: int, company_type: str, collection_type: str) -> 'Collection':
-        """Carrega collection do disco."""
-        tenant_category = "public" if company_type == "public" else "private"
-        collection_path = f"collections/{tenant_category}/{str(company_id)}/{collection_type}"
+        """Carregar collection do disco - índice FAISS + posições invalidadas."""
+        import pickle
         
-        # Carregar metadata
-        metadata_path = f"{collection_path}.pkl"
-        with open(metadata_path, 'rb') as f:
-            data = pickle.load(f)
+        collection = cls(company_id, company_type, collection_type)
         
-        # Criar collection
-        collection = cls(
-            company_id=data['company_id'],
-            company_type=data['company_type'],
-            collection_type=data['collection_type'],
-            metadata=data['metadata']
-        )
+        index_path = f"{collection.collection_path}.index"
+        invalidated_path = f"{collection.collection_path}.invalidated"
         
-        # Restaurar dados
-        collection.created_at = data['created_at']
-        collection.updated_at = data['updated_at']
-        collection.face_count = data['face_count']
-        collection.face_ids = data['face_ids']
-        collection.face_id_mapping = data['face_id_mapping']
-        collection.face_metadata = data['face_metadata']
-        collection.removed_positions = data['removed_positions']
-        
-        # Carregar índice FAISS
-        index_path = f"{collection_path}.index"
-        if os.path.exists(index_path):
-            collection.index = faiss.read_index(index_path)
+        try:
+            # Carregar índice FAISS
+            if os.path.exists(index_path):
+                collection.index = faiss.read_index(index_path)
+                
+                # Carregar posições invalidadas
+                if os.path.exists(invalidated_path):
+                    with open(invalidated_path, 'rb') as f:
+                        collection.invalidated_positions = pickle.load(f)
+                
+                valid_faces = collection.index.ntotal - len(collection.invalidated_positions)
+                logger.info(f"📂 Collection carregada: {collection.collection_key} "
+                           f"({collection.index.ntotal} total, {valid_faces} válidas, "
+                           f"{len(collection.invalidated_positions)} invalidadas)")
+            else:
+                logger.info(f"📂 Nova collection criada: {collection.collection_key}")
+                
+        except Exception as e:
+            logger.warning(f"⚠️ Erro ao carregar collection {collection.collection_key}: {e}")
+            logger.info("🔄 Criando nova collection...")
+            collection._initialize_index()
+            collection.invalidated_positions = set()
         
         return collection
-
-    def get_embedding_at_position(self, index_position: int) -> Optional[np.ndarray]:
-        """
-        Recupera o embedding de uma posição específica no índice.
-        
-        Args:
-            index_position: Posição no índice FAISS
-            
-        Returns:
-            Embedding como array numpy ou None se inválido
-        """
-        if index_position < 0 or index_position >= self.face_count:
-            self.logger.warning(f"Posição inválida para recuperação: {index_position}")
-            return None
-            
-        if index_position in self.removed_positions:
-            self.logger.warning(f"Face na posição {index_position} foi removida")
-            return None
-        
-        if self.index is None or self.index.ntotal == 0:
-            self.logger.warning("Índice FAISS vazio")
-            return None
-        
-        # Recuperar vetor do FAISS
-        try:
-            embedding = self.index.reconstruct(index_position)
-            return embedding.astype(np.float64)  # Converter para double precision
-        except Exception as e:
-            self.logger.error(f"Erro ao recuperar embedding da posição {index_position}: {e}")
-            return None
+    
+    @property
+    def face_count(self) -> int:
+        """Número de faces VÁLIDAS na collection (total - invalidadas)."""
+        total = self.index.ntotal if self.index else 0
+        return total - len(self.invalidated_positions)
+    
+    @property  
+    def total_face_count(self) -> int:
+        """Número total de faces na collection (incluindo invalidadas)."""
+        return self.index.ntotal if self.index else 0
 
 
 class CollectionManager:
@@ -275,28 +223,12 @@ class CollectionManager:
     async def get_or_create_collection(self, company_id: int, company_type: str, 
                                      collection_type: str) -> Collection:
         """Retorna collection existente ou cria nova se não existir."""
-        tenant_category = "public" if company_type == "public" else "private"
-        collection_key = f"{tenant_category}/{company_id}/{collection_type}"
+        collection_key = f"{company_type}_{company_id}_{collection_type}"
         
         if collection_key not in self.collections_cache:
-            collection_path = f"collections/{tenant_category}/{str(company_id)}/{collection_type}"
-            
-            if os.path.exists(f"{collection_path}.pkl"):
-                # Carregar existente
-                self.logger.info(f"📁 Carregando collection existente: {collection_key}")
-                collection = Collection.load_from_disk(company_id, company_type, collection_type)
-            else:
-                # Criar nova
-                self.logger.info(f"📁 Criando nova collection: {collection_key}")
-                collection = Collection(
-                    company_id=company_id,
-                    company_type=company_type,
-                    collection_type=collection_type
-                )
-                collection.was_just_created = True
-                # Salvar nova collection
-                collection.save_to_disk()
-                
+            # Tentar carregar do disco ou criar nova
+            self.logger.info(f"📁 Carregando/criando collection: {collection_key}")
+            collection = Collection.load_from_disk(company_id, company_type, collection_type)
             self.collections_cache[collection_key] = collection
         
         return self.collections_cache[collection_key]
@@ -486,7 +418,7 @@ class MatchService:
                 category = "public" if company_type == "public" else "private"
                 matches_formatted = {
                     category: {
-                        company_id: [MatchResult(
+                        str(company_id): [MatchResult(
                             index_position=best_match["index_position"],
                             similarity=best_match["similarity"],
                             confidence=best_match["confidence"]
@@ -602,10 +534,11 @@ class MatchService:
                         "confidence": match["confidence"]
                     })
                 
-                # Armazenar por categoria e company
-                if company_id not in results_by_category[category]:
-                    results_by_category[category][company_id] = []
-                results_by_category[category][company_id].extend(simplified_matches)
+                # Armazenar por categoria e company (converter company_id para string)
+                company_id_str = str(company_id)
+                if company_id_str not in results_by_category[category]:
+                    results_by_category[category][company_id_str] = []
+                results_by_category[category][company_id_str].extend(simplified_matches)
                 
                 # Adicionar ao consolidado (manter estrutura original para compatibilidade interna)
                 all_results.extend(matches)
@@ -622,16 +555,11 @@ class MatchService:
             company_id, company_type, collection_type
         )
         
-        face_id = str(uuid.uuid4())
-        
         # Converter embedding para numpy
         embedding_array = np.array(embedding, dtype=np.float32)
         
-        # Posição que será ocupada no índice (antes de adicionar)
-        index_position = collection.face_count
-        
-        # Adicionar à collection
-        collection.add_face(embedding_array, face_id)
+        # Adicionar à collection e obter posição
+        index_position = collection.add_face(embedding_array)
         
         # Salvar alterações
         collection.save_to_disk()
@@ -642,19 +570,35 @@ class MatchService:
     
     async def remove_face_from_collection(self, company_id: int, company_type: str, 
                                         collection_type: str, index_position: int) -> bool:
-        """Remove uma face de uma collection."""
-        collection = await self.collection_manager.get_or_create_collection(
-            company_id, company_type, collection_type
-        )
+        """
+        Remove (invalida) uma face de uma collection.
         
-        success = collection.remove_face(index_position)
-        
-        if success:
-            self.logger.info(f"🗑️ Face removida da posição {index_position} da collection {collection.collection_key}")
-        else:
-            self.logger.warning(f"❌ Falha ao remover face da posição {index_position} da collection {collection.collection_key}")
-        
-        return success
+        Usa invalidação local: mantém o embedding no FAISS mas filtra dos resultados.
+        Para remoção definitiva, você deve fazer no PostgreSQL.
+        """
+        try:
+            collection = await self.collection_manager.get_or_create_collection(
+                company_id, company_type, collection_type
+            )
+            
+            # Invalidar localmente
+            success = collection.invalidate_position(index_position)
+            
+            if success:
+                # Salvar alterações (incluindo lista de invalidadas)
+                collection.save_to_disk()
+                
+                self.logger.info(f"✅ Face na posição {index_position} invalidada em {company_type}/{company_id}/{collection_type}")
+                self.logger.info(f"💡 Total: {collection.total_face_count}, Válidas: {collection.face_count}, Invalidadas: {len(collection.invalidated_positions)}")
+                
+                return True
+            else:
+                self.logger.warning(f"❌ Posição {index_position} inválida ou fora do range em {company_type}/{company_id}/{collection_type}")
+                return False
+                
+        except Exception as e:
+            self.logger.error(f"❌ Erro ao invalidar face na posição {index_position}: {e}")
+            return False
     
     async def get_stats(self) -> ServiceStats:
         """Retorna estatísticas do serviço."""
@@ -668,14 +612,27 @@ class MatchService:
         process = psutil.Process()
         memory_mb = process.memory_info().rss / 1024 / 1024
         
+        # Contar faces válidas vs totais
+        total_faces = 0
+        valid_faces = 0
+        invalidated_faces = 0
+        
+        for collection in self.collection_manager.collections_cache.values():
+            total_faces += collection.total_face_count
+            valid_faces += collection.face_count
+            invalidated_faces += len(collection.invalidated_positions)
+        
         return ServiceStats(
             uptime_seconds=uptime,
             total_smart_matches=self.stats['total_smart_matches'],
             total_collections=len(self.collection_manager.collections_cache),
-            total_faces=sum(col.face_count for col in self.collection_manager.collections_cache.values()),
+            total_faces=valid_faces,  # Mostrar apenas faces válidas no total
             average_match_time_ms=avg_match_time,
             auto_registrations=self.stats['auto_registrations'],
-            memory_usage_mb=memory_mb
+            memory_usage_mb=memory_mb,
+            # Adicionar informações extras para debug
+            total_faces_including_invalidated=total_faces,
+            invalidated_faces=invalidated_faces
         )
     
     async def cleanup(self) -> None:
@@ -691,120 +648,107 @@ class MatchService:
         
         self.logger.info("✅ Cleanup concluído")
     
-    async def promote_face(self, company_id: int, company_type: str, 
-                          from_index_position: int) -> Dict:
-        """
-        Promove uma face de 'unknown' para 'known'.
-        
-        Args:
-            company_id: ID da empresa
-            company_type: Tipo da empresa
-            from_index_position: Posição na collection 'unknown'
-            
-        Returns:
-            Resultado da promoção
-        """
-        try:
-            # 1. Pegar collection 'unknown' e embedding
-            unknown_collection = await self.collection_manager.get_or_create_collection(
-                company_id, company_type, "unknown"
-            )
-            
-            embedding = unknown_collection.get_embedding_at_position(from_index_position)
-            if embedding is None:
-                return {
-                    "success": False,
-                    "error": f"Embedding não encontrado na posição {from_index_position}"
-                }
-            
-            # 2. Soft delete na collection 'unknown'
-            success = unknown_collection.remove_face(from_index_position)
-            if not success:
-                return {
-                    "success": False,
-                    "error": f"Falha ao remover face da posição {from_index_position}"
-                }
-            
-            # 3. Adicionar na collection 'known'
-            new_index_position = await self.add_face_to_collection(
-                company_id=company_id,
-                company_type=company_type,
-                collection_type="known",
-                embedding=embedding.tolist()
-            )
-            
-            self.logger.info(f"🔼 Face promovida: unknown[{from_index_position}] → known[{new_index_position}]")
-            
-            return {
-                "success": True,
-                "old_index_position": from_index_position,
-                "new_index_position": new_index_position,
-                "company_id": company_id,
-                "promoted_at": datetime.utcnow()
-            }
-            
-        except Exception as e:
-            self.logger.error(f"❌ Erro na promoção de face: {e}")
-            return {
-                "success": False,
-                "error": str(e)
-            }
+    # NOTA: Métodos promote/demote removidos
+    # Com FAISS puro, promoção/rebaixamento deve ser feita:
+    # 1. Obter embedding da posição original via PostgreSQL
+    # 2. Adicionar na nova collection  
+    # 3. Marcar original como removida no PostgreSQL
+
+    # Novos métodos para trabalhar com paths de collections
     
-    async def demote_face(self, company_id: int, company_type: str, 
-                         from_index_position: int) -> Dict:
+    def _parse_collection_path(self, collection_path: str) -> tuple[str, int, str]:
         """
-        Rebaixa uma face de 'known' para 'unknown'.
+        Fazer parse do path da collection.
         
         Args:
-            company_id: ID da empresa
-            company_type: Tipo da empresa
-            from_index_position: Posição na collection 'known'
+            collection_path: Path no formato "company_type/company_id/collection_type"
             
         Returns:
-            Resultado do rebaixamento
+            tuple: (company_type, company_id, collection_type)
         """
+        parts = collection_path.split('/')
+        if len(parts) != 3:
+            raise ValueError('Path deve ter formato: company_type/company_id/collection_type')
+        
+        company_type, company_id_str, collection_type = parts
+        
+        if company_type not in ['public', 'private']:
+            raise ValueError('company_type deve ser "public" ou "private"')
+        
         try:
-            # 1. Pegar collection 'known' e embedding
-            known_collection = await self.collection_manager.get_or_create_collection(
-                company_id, company_type, "known"
-            )
+            company_id = int(company_id_str)
+        except ValueError:
+            raise ValueError('company_id deve ser um número')
             
-            embedding = known_collection.get_embedding_at_position(from_index_position)
-            if embedding is None:
-                return {
-                    "success": False,
-                    "error": f"Embedding não encontrado na posição {from_index_position}"
-                }
+        if collection_type not in ['known', 'unknown']:
+            raise ValueError('collection_type deve ser "known" ou "unknown"')
             
-            # 2. Soft delete na collection 'known'
-            success = known_collection.remove_face(from_index_position)
-            if not success:
-                return {
-                    "success": False,
-                    "error": f"Falha ao remover face da posição {from_index_position}"
-                }
+        return company_type, company_id, collection_type
+
+    async def add_face_by_path(self, collection_path: str, embedding: List[float]) -> int:
+        """
+        Adicionar face usando path da collection.
+        
+        Args:
+            collection_path: Path no formato "company_type/company_id/collection_type"
+            embedding: Embedding da face
             
-            # 3. Adicionar na collection 'unknown'
-            new_index_position = await self.add_face_to_collection(
-                company_id=company_id,
-                company_type=company_type,
-                collection_type="unknown",
-                embedding=embedding.tolist()
-            )
+        Returns:
+            Posição no índice FAISS
+        """
+        company_type, company_id, collection_type = self._parse_collection_path(collection_path)
+        
+        return await self.add_face_to_collection(
+            company_id=company_id,
+            company_type=company_type,
+            collection_type=collection_type,
+            embedding=embedding
+        )
+
+    async def remove_face_by_path(self, collection_path: str, index_position: int) -> bool:
+        """
+        Remover face usando path da collection.
+        
+        Args:
+            collection_path: Path no formato "company_type/company_id/collection_type"
+            index_position: Posição no índice FAISS
             
-            self.logger.info(f"🔽 Face rebaixada: known[{from_index_position}] → unknown[{new_index_position}]")
+        Returns:
+            True se removido com sucesso
+        """
+        company_type, company_id, collection_type = self._parse_collection_path(collection_path)
+        
+        return await self.remove_face_from_collection(
+            company_id=company_id,
+            company_type=company_type,
+            collection_type=collection_type,
+            index_position=index_position
+        )
+
+    async def transfer_face(self, origin_path: str, target_path: str, index_position: int) -> Dict:
+        """
+        Transferir face entre collections.
+        
+        NOTA: Com FAISS puro, você deve:
+        1. Obter embedding da posição original via PostgreSQL (não do FAISS)
+        2. Adicionar na nova collection
+        3. Marcar original como removida no PostgreSQL
+        
+        Args:
+            origin_path: Path da collection de origem
+            target_path: Path da collection de destino
+            index_position: Posição no índice FAISS da collection de origem
             
-            return {
-                "success": True,
-                "old_index_position": from_index_position,
-                "new_index_position": new_index_position,
-                "company_id": company_id,
-                "demoted_at": datetime.utcnow()
-            }
-            
-        except Exception as e:
-            self.logger.error(f"❌ Erro no rebaixamento de face: {e}")
-            return {
-                "success": False,
-                "error": str(e)
-            } 
+        Returns:
+            Dicionário com informações da transferência
+        """
+        self.logger.error(f"❌ Transfer não suportado com FAISS puro!")
+        self.logger.error(f"💡 Implemente via PostgreSQL:")
+        self.logger.error(f"   1. SELECT embedding FROM faces WHERE index_position = {index_position}")
+        self.logger.error(f"   2. POST /api/v2/faces com embedding + {target_path}")
+        self.logger.error(f"   3. UPDATE faces SET removed = true WHERE index_position = {index_position}")
+        
+        raise ValueError(
+            "Transfer não suportado com FAISS puro. "
+            "Use PostgreSQL para obter embedding e adicionar na nova collection."
+        ) 
