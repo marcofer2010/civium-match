@@ -24,7 +24,11 @@ from app.models.api_models import (
     AddFaceRequest,
     AddFaceResponse,
     RemoveFaceRequest,
-    RemoveFaceResponse
+    RemoveFaceResponse,
+    PromoteFaceRequest,
+    PromoteFaceResponse,
+    DemoteFaceRequest,
+    DemoteFaceResponse
 )
 from app.utils.logger import setup_logger
 
@@ -282,6 +286,126 @@ async def get_service_stats():
         )
     
     return await match_service.get_stats()
+
+@app.post("/api/faces/promote", response_model=PromoteFaceResponse)
+async def promote_face(request: PromoteFaceRequest):
+    """
+    Promove uma face de 'unknown' para 'known'.
+    
+    Move uma face da collection 'unknown' para a collection 'known' da mesma empresa.
+    Útil quando uma pessoa desconhecida é identificada.
+    
+    Args:
+        request: Dados da face a ser promovida
+        
+    Returns:
+        Resultado da promoção com novas posições
+    """
+    if not match_service or not match_service.is_ready:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Match service não está pronto"
+        )
+    
+    try:
+        logger.info(f"🔼 Promoting face: company={request.company_id}, type={request.company_type}, "
+                   f"from_position={request.from_index_position}")
+        
+        start_time = time.time()
+        
+        result = await match_service.promote_face(
+            company_id=request.company_id,
+            company_type=request.company_type,
+            from_index_position=request.from_index_position
+        )
+        
+        elapsed_time = (time.time() - start_time) * 1000
+        
+        if result["success"]:
+            logger.info(f"✅ Face promoted in {elapsed_time:.1f}ms: "
+                       f"unknown[{result['old_index_position']}] → known[{result['new_index_position']}]")
+            
+            return PromoteFaceResponse(
+                success=True,
+                old_index_position=result["old_index_position"],
+                new_index_position=result["new_index_position"],
+                company_id=request.company_id,
+                promoted_at=result["promoted_at"]
+            )
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=result.get("error", "Falha na promoção da face")
+            )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Promote face error: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Erro ao promover face: {str(e)}"
+        )
+
+@app.post("/api/faces/demote", response_model=DemoteFaceResponse)
+async def demote_face(request: DemoteFaceRequest):
+    """
+    Rebaixa uma face de 'known' para 'unknown'.
+    
+    Move uma face da collection 'known' para a collection 'unknown' da mesma empresa.
+    Útil para correções ou mudanças de status.
+    
+    Args:
+        request: Dados da face a ser rebaixada
+        
+    Returns:
+        Resultado do rebaixamento com novas posições
+    """
+    if not match_service or not match_service.is_ready:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Match service não está pronto"
+        )
+    
+    try:
+        logger.info(f"🔽 Demoting face: company={request.company_id}, type={request.company_type}, "
+                   f"from_position={request.from_index_position}")
+        
+        start_time = time.time()
+        
+        result = await match_service.demote_face(
+            company_id=request.company_id,
+            company_type=request.company_type,
+            from_index_position=request.from_index_position
+        )
+        
+        elapsed_time = (time.time() - start_time) * 1000
+        
+        if result["success"]:
+            logger.info(f"✅ Face demoted in {elapsed_time:.1f}ms: "
+                       f"known[{result['old_index_position']}] → unknown[{result['new_index_position']}]")
+            
+            return DemoteFaceResponse(
+                success=True,
+                old_index_position=result["old_index_position"],
+                new_index_position=result["new_index_position"],
+                company_id=request.company_id,
+                demoted_at=result["demoted_at"]
+            )
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=result.get("error", "Falha no rebaixamento da face")
+            )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Demote face error: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Erro ao rebaixar face: {str(e)}"
+        )
 
 # Exception handlers
 @app.exception_handler(Exception)

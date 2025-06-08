@@ -234,6 +234,36 @@ class Collection:
         
         return collection
 
+    def get_embedding_at_position(self, index_position: int) -> Optional[np.ndarray]:
+        """
+        Recupera o embedding de uma posição específica no índice.
+        
+        Args:
+            index_position: Posição no índice FAISS
+            
+        Returns:
+            Embedding como array numpy ou None se inválido
+        """
+        if index_position < 0 or index_position >= self.face_count:
+            self.logger.warning(f"Posição inválida para recuperação: {index_position}")
+            return None
+            
+        if index_position in self.removed_positions:
+            self.logger.warning(f"Face na posição {index_position} foi removida")
+            return None
+        
+        if self.index is None or self.index.ntotal == 0:
+            self.logger.warning("Índice FAISS vazio")
+            return None
+        
+        # Recuperar vetor do FAISS
+        try:
+            embedding = self.index.reconstruct(index_position)
+            return embedding.astype(np.float64)  # Converter para double precision
+        except Exception as e:
+            self.logger.error(f"Erro ao recuperar embedding da posição {index_position}: {e}")
+            return None
+
 
 class CollectionManager:
     """Gerenciador de collections com criação automática."""
@@ -659,4 +689,122 @@ class MatchService:
             except Exception as e:
                 self.logger.error(f"❌ Erro ao salvar collection {collection.collection_key}: {e}")
         
-        self.logger.info("✅ Cleanup concluído") 
+        self.logger.info("✅ Cleanup concluído")
+    
+    async def promote_face(self, company_id: int, company_type: str, 
+                          from_index_position: int) -> Dict:
+        """
+        Promove uma face de 'unknown' para 'known'.
+        
+        Args:
+            company_id: ID da empresa
+            company_type: Tipo da empresa
+            from_index_position: Posição na collection 'unknown'
+            
+        Returns:
+            Resultado da promoção
+        """
+        try:
+            # 1. Pegar collection 'unknown' e embedding
+            unknown_collection = await self.collection_manager.get_or_create_collection(
+                company_id, company_type, "unknown"
+            )
+            
+            embedding = unknown_collection.get_embedding_at_position(from_index_position)
+            if embedding is None:
+                return {
+                    "success": False,
+                    "error": f"Embedding não encontrado na posição {from_index_position}"
+                }
+            
+            # 2. Soft delete na collection 'unknown'
+            success = unknown_collection.remove_face(from_index_position)
+            if not success:
+                return {
+                    "success": False,
+                    "error": f"Falha ao remover face da posição {from_index_position}"
+                }
+            
+            # 3. Adicionar na collection 'known'
+            new_index_position = await self.add_face_to_collection(
+                company_id=company_id,
+                company_type=company_type,
+                collection_type="known",
+                embedding=embedding.tolist()
+            )
+            
+            self.logger.info(f"🔼 Face promovida: unknown[{from_index_position}] → known[{new_index_position}]")
+            
+            return {
+                "success": True,
+                "old_index_position": from_index_position,
+                "new_index_position": new_index_position,
+                "company_id": company_id,
+                "promoted_at": datetime.utcnow()
+            }
+            
+        except Exception as e:
+            self.logger.error(f"❌ Erro na promoção de face: {e}")
+            return {
+                "success": False,
+                "error": str(e)
+            }
+    
+    async def demote_face(self, company_id: int, company_type: str, 
+                         from_index_position: int) -> Dict:
+        """
+        Rebaixa uma face de 'known' para 'unknown'.
+        
+        Args:
+            company_id: ID da empresa
+            company_type: Tipo da empresa
+            from_index_position: Posição na collection 'known'
+            
+        Returns:
+            Resultado do rebaixamento
+        """
+        try:
+            # 1. Pegar collection 'known' e embedding
+            known_collection = await self.collection_manager.get_or_create_collection(
+                company_id, company_type, "known"
+            )
+            
+            embedding = known_collection.get_embedding_at_position(from_index_position)
+            if embedding is None:
+                return {
+                    "success": False,
+                    "error": f"Embedding não encontrado na posição {from_index_position}"
+                }
+            
+            # 2. Soft delete na collection 'known'
+            success = known_collection.remove_face(from_index_position)
+            if not success:
+                return {
+                    "success": False,
+                    "error": f"Falha ao remover face da posição {from_index_position}"
+                }
+            
+            # 3. Adicionar na collection 'unknown'
+            new_index_position = await self.add_face_to_collection(
+                company_id=company_id,
+                company_type=company_type,
+                collection_type="unknown",
+                embedding=embedding.tolist()
+            )
+            
+            self.logger.info(f"🔽 Face rebaixada: known[{from_index_position}] → unknown[{new_index_position}]")
+            
+            return {
+                "success": True,
+                "old_index_position": from_index_position,
+                "new_index_position": new_index_position,
+                "company_id": company_id,
+                "demoted_at": datetime.utcnow()
+            }
+            
+        except Exception as e:
+            self.logger.error(f"❌ Erro no rebaixamento de face: {e}")
+            return {
+                "success": False,
+                "error": str(e)
+            } 
