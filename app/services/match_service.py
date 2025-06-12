@@ -16,6 +16,10 @@ from app.config import settings
 from app.models.api_models import (
     SmartMatchResponse,
     MatchResult,
+    OwnCompanyMatch,
+    OtherCompanyMatch,
+    AutoRegisteredInfo,
+    MatchSummary,
     ServiceStats
 )
 from app.utils.logger import setup_logger
@@ -381,10 +385,23 @@ class MatchService:
                     total_matches = sum(len(matches) for matches in companies.values())
                     self.logger.info(f"   📁 {category}: {company_count} companies, {total_matches} matches")
             
+            # Converter para nova estrutura
+            new_structure = self._convert_to_new_structure(
+                all_results=known_results,
+                request_company_id=company_id,
+                request_company_type=company_type,
+                collections_searched=collections_searched,
+                search_time_ms=search_time_ms
+            )
+            
             return SmartMatchResponse(
                 query_embedding_hash=embedding_hash,
                 search_performed=search_details,
                 result_type="found_known",
+                own_company_matches=new_structure['own_company_matches'],
+                other_companies_matches=new_structure['other_companies_matches'],
+                summary=new_structure['summary'],
+                # Campos deprecated para compatibilidade
                 matches=matches_formatted if matches_formatted else None,
                 auto_registered_index=None,
                 total_collections_searched=collections_searched,
@@ -414,7 +431,27 @@ class MatchService:
                 
                 self.logger.info(f"✅ Encontrado em collection 'unknown': {company_id}")
                 
-                # Organizar o match na nova estrutura por categoria
+                # Criar estrutura para nova resposta
+                own_matches = [OwnCompanyMatch(
+                    index_position=best_match["index_position"],
+                    similarity=best_match["similarity"],
+                    confidence=best_match["confidence"],
+                    collection_type="unknown",
+                    rank=1
+                )]
+                
+                summary = MatchSummary(
+                    own_matches_count=1,
+                    other_matches_count=0,
+                    total_matches=1,
+                    highest_own_similarity=best_match["similarity"],
+                    highest_other_similarity=None,
+                    companies_found=[str(company_id)],
+                    collections_searched=collections_searched,
+                    search_time_ms=search_time_ms
+                )
+                
+                # Organizar o match na estrutura antiga para compatibilidade
                 category = "public" if company_type == "public" else "private"
                 matches_formatted = {
                     category: {
@@ -430,6 +467,10 @@ class MatchService:
                     query_embedding_hash=embedding_hash,
                     search_performed=search_details,
                     result_type="found_unknown",
+                    own_company_matches=own_matches,
+                    other_companies_matches=[],
+                    summary=summary,
+                    # Campos deprecated para compatibilidade
                     matches=matches_formatted if matches_formatted else None,
                     auto_registered_index=None,
                     total_collections_searched=collections_searched,
@@ -457,10 +498,33 @@ class MatchService:
             
             self.logger.info(f"✅ Face auto-registrada na posição: {index_position}")
             
+            # Criar estrutura para nova resposta
+            auto_registered_info = AutoRegisteredInfo(
+                index_position=index_position,
+                collection_type="unknown",
+                collection_path=f"{company_type}/{company_id}/unknown"
+            )
+            
+            summary = MatchSummary(
+                own_matches_count=0,
+                other_matches_count=0,
+                total_matches=0,
+                highest_own_similarity=None,
+                highest_other_similarity=None,
+                companies_found=[str(company_id)],
+                collections_searched=collections_searched,
+                search_time_ms=search_time_ms
+            )
+            
             return SmartMatchResponse(
                 query_embedding_hash=embedding_hash,
                 search_performed=search_details,
                 result_type="auto_registered",
+                own_company_matches=[],
+                other_companies_matches=[],
+                auto_registered=auto_registered_info,
+                summary=summary,
+                # Campos deprecated para compatibilidade
                 matches=None,
                 auto_registered_index=index_position,
                 total_collections_searched=collections_searched,
@@ -477,10 +541,26 @@ class MatchService:
         
         self.logger.info(f"❌ Não encontrado em nenhuma collection")
         
+        # Criar estrutura para nova resposta
+        summary = MatchSummary(
+            own_matches_count=0,
+            other_matches_count=0,
+            total_matches=0,
+            highest_own_similarity=None,
+            highest_other_similarity=None,
+            companies_found=[],
+            collections_searched=collections_searched,
+            search_time_ms=search_time_ms
+        )
+        
         return SmartMatchResponse(
             query_embedding_hash=embedding_hash,
             search_performed=search_details,
             result_type="not_found",
+            own_company_matches=[],
+            other_companies_matches=[],
+            summary=summary,
+            # Campos deprecated para compatibilidade
             matches=None,
             auto_registered_index=None,
             total_collections_searched=collections_searched,
@@ -528,6 +608,15 @@ class MatchService:
                 # Simplificar matches (usar apenas dados do FAISS)
                 simplified_matches = []
                 for match in matches:
+                    # Adicionar informações da collection para nova estrutura
+                    enhanced_match = {
+                        "index_position": match["index_position"],
+                        "similarity": match["similarity"], 
+                        "confidence": match["confidence"],
+                        "collection": collection  # ✅ NOVA INFORMAÇÃO
+                    }
+                    all_results.append(enhanced_match)
+                    
                     simplified_matches.append({
                         "index_position": match["index_position"],
                         "similarity": match["similarity"], 
@@ -539,9 +628,6 @@ class MatchService:
                 if company_id_str not in results_by_category[category]:
                     results_by_category[category][company_id_str] = []
                 results_by_category[category][company_id_str].extend(simplified_matches)
-                
-                # Adicionar ao consolidado (manter estrutura original para compatibilidade interna)
-                all_results.extend(matches)
         
         # Ordenar consolidado por similaridade (maior primeiro)
         all_results.sort(key=lambda x: x['similarity'], reverse=True)
@@ -751,4 +837,83 @@ class MatchService:
         raise ValueError(
             "Transfer não suportado com FAISS puro. "
             "Use PostgreSQL para obter embedding e adicionar na nova collection."
-        ) 
+        )
+
+    def _convert_to_new_structure(self, all_results: List[Dict], 
+                                 request_company_id: int, request_company_type: str,
+                                 collections_searched: int, search_time_ms: float) -> dict:
+        """
+        Converte resultados da busca para nova estrutura organizada.
+        
+        Args:
+            all_results: Lista consolidada de matches
+            request_company_id: ID da empresa que fez a requisição  
+            request_company_type: Tipo da empresa que fez a requisição
+            collections_searched: Número de collections pesquisadas
+            search_time_ms: Tempo de busca em ms
+            
+        Returns:
+            Dicionário com nova estrutura
+        """
+        own_matches = []
+        other_matches = []
+        companies_found = set()
+        
+        own_rank = 1
+        other_rank = 1
+        
+        for result in all_results:
+            collection = result.get('collection')
+            if not collection:
+                continue
+                
+            companies_found.add(str(collection.company_id))
+            
+            # Determinar se é da própria empresa
+            is_own_company = (collection.company_id == request_company_id and 
+                            collection.company_type == request_company_type)
+            
+            if is_own_company:
+                # Match da própria empresa
+                own_matches.append(OwnCompanyMatch(
+                    index_position=result["index_position"],
+                    similarity=result["similarity"],
+                    confidence=result["confidence"],
+                    collection_type=collection.collection_type,
+                    rank=own_rank
+                ))
+                own_rank += 1
+            else:
+                # Match de outra empresa
+                other_matches.append(OtherCompanyMatch(
+                    index_position=result["index_position"],
+                    similarity=result["similarity"], 
+                    confidence=result["confidence"],
+                    collection_type=collection.collection_type,
+                    company_id=str(collection.company_id),
+                    company_type=collection.company_type,
+                    collection_path=f"{collection.company_type}/{collection.company_id}/{collection.collection_type}",
+                    rank=other_rank
+                ))
+                other_rank += 1
+        
+        # Calcular estatísticas
+        highest_own_similarity = max([m.similarity for m in own_matches], default=None)
+        highest_other_similarity = max([m.similarity for m in other_matches], default=None)
+        
+        summary = MatchSummary(
+            own_matches_count=len(own_matches),
+            other_matches_count=len(other_matches),
+            total_matches=len(own_matches) + len(other_matches),
+            highest_own_similarity=highest_own_similarity,
+            highest_other_similarity=highest_other_similarity,
+            companies_found=list(companies_found),
+            collections_searched=collections_searched,
+            search_time_ms=search_time_ms
+        )
+        
+        return {
+            'own_company_matches': own_matches,
+            'other_companies_matches': other_matches,
+            'summary': summary
+        } 
